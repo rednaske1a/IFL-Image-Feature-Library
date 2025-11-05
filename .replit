@@ -2,7 +2,7 @@ modules = ["python-3.11"]
 
 [nix]
 channel = "stable-25_05"
-packages = ["freetype", "lcms2", "libGL", "libGLU", "libimagequant", "libjpeg", "libjpeg_turbo", "libpng", "libtiff", "libwebp", "libxcrypt", "openjpeg", "tcl", "tk", "which", "zlib", "git"]
+packages = ["ffmpeg-full", "freetype", "git", "lcms2", "libGL", "libGLU", "libimagequant", "libjpeg", "libjpeg_turbo", "libpng", "libtiff", "libwebp", "libxcrypt", "openjpeg", "pkg-config", "tcl", "tk", "which", "xsimd", "zlib"]
 
 [deployment]
 deploymentTarget = "autoscale"
@@ -35,6 +35,10 @@ outputType = "webview"
 [[ports]]
 localPort = 5000
 externalPort = 80
+
+[[ports]]
+localPort = 39641
+externalPort = 3001
 
 [[ports]]
 localPort = 45355
