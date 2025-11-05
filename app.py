@@ -23,6 +23,15 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+def load_custom_css():
+    """Load custom CSS for gelbooru-style UI"""
+    css_file = ".streamlit/style.css"
+    if os.path.exists(css_file):
+        with open(css_file) as f:
+            st.markdown(f'<style>{f.read()}</style>', unsafe_allow_html=True)
+
+load_custom_css()
+
 UPLOAD_DIR = "data/uploads"
 VIDEO_DIR = "data/videos"
 SEGMENTS_DIR = "data/segments"
@@ -887,8 +896,12 @@ def analytics_interface(metadata_db):
             st.plotly_chart(fig, use_container_width=True)
 
 def main():
-    st.title("🎨 Booru Media Library")
-    st.markdown("*Advanced media search with CLIP embeddings, tagging, and segmentation*")
+    st.markdown("""
+    <div class="booru-header">
+        <h1 class="booru-title">Gelbooru</h1>
+        <p class="booru-subtitle">Advanced media search with CLIP embeddings, tagging, and segmentation</p>
+    </div>
+    """, unsafe_allow_html=True)
     
     model_manager = load_models()
     vector_db = get_vector_db()
@@ -901,15 +914,25 @@ def main():
         return
     
     with st.sidebar:
-        st.header("📊 Library Stats")
+        st.markdown("### 📊 Library Stats")
         stats = metadata_db.get_statistics()
-        st.metric("Total Media", stats['total_media'])
-        st.metric("Favorites", stats['total_favorites'])
-        st.metric("Total Tags", stats['total_tags'])
+        
+        st.markdown(f"""
+        <div class="stats-box">
+            <div class="stat-number">{stats['total_media']}</div>
+            <div class="stat-label">Total Media</div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("⭐ Favorites", stats['total_favorites'])
+        with col2:
+            st.metric("🏷️ Tags", stats['total_tags'])
         
         st.divider()
         
-        st.header("🔧 Settings")
+        st.markdown("### 🔧 Settings")
         
         st.subheader("SAM Model")
         if sam_manager.is_downloaded():

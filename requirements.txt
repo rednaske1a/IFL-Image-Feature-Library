@@ -1,0 +1,35 @@
+# Core Dependencies
+streamlit>=1.28.0
+torch>=2.0.0
+numpy>=1.24.0
+pillow>=10.0.0
+
+# Vector Database
+chromadb>=0.4.0
+
+# Computer Vision
+opencv-python>=4.8.0
+opencv-python-headless>=4.8.0
+
+# Image Processing
+imageio>=2.31.0
+imageio-ffmpeg>=0.4.9
+scipy>=1.11.0
+
+# CLIP Dependencies
+ftfy>=6.1.0
+regex>=2023.0.0
+tqdm>=4.66.0
+
+# UI Components
+streamlit-tags>=1.2.8
+plotly>=5.17.0
+
+# Utilities
+python-multipart>=0.0.6
+packaging>=23.0
+
+# Optional: For GPU acceleration
+# Install CUDA-compatible PyTorch from https://pytorch.org/get-started/locally/
+# Example for CUDA 11.8:
+# torch==2.0.1+cu118 -f https://download.pytorch.org/whl/torch_stable.html
