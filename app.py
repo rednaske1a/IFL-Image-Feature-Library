@@ -156,8 +156,13 @@ def process_image_with_segments(image_file, model_manager, vector_db, metadata_d
                 continue
             
             segment_id = f"{file_id}_seg_{idx:03d}"
+            segment_filename = f"{segment_id}.jpg"
+            segment_path = os.path.join(SEGMENTS_DIR, segment_filename)
             
-            embedding = model_manager.encode(segment_data['pil_image'])
+            segment_pil = segment_data['pil_image']
+            segment_pil.save(segment_path, 'JPEG', quality=95)
+            
+            embedding = model_manager.encode(segment_pil)
             
             segment_metadata = {
                 'segment_id': segment_id,
@@ -165,7 +170,8 @@ def process_image_with_segments(image_file, model_manager, vector_db, metadata_d
                 'type': 'segment',
                 'parent_media_id': file_id,
                 'timestamp': datetime.now().isoformat(),
-                'filepath': filepath,
+                'filepath': segment_path,
+                'parent_filepath': filepath,
                 'bbox': segment_data['bbox'],
                 'rating': rating
             }
@@ -188,6 +194,148 @@ def process_image_with_segments(image_file, model_manager, vector_db, metadata_d
             segment_count += 1
         
         return file_id, segment_count
+
+def process_video_with_segments(video_file, model_manager, vector_db, metadata_db, video_processor,
+                                 sam_manager, extract_every_n=30, tags=None, rating='safe'):
+    """Process uploaded video with segmentation on frames"""
+    video_id = str(uuid.uuid4())[:8]
+    filename = f"{video_id}_{video_file.name}"
+    filepath = os.path.join(VIDEO_DIR, filename)
+    
+    with open(filepath, "wb") as f:
+        f.write(video_file.getbuffer())
+    
+    file_size = os.path.getsize(filepath)
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    status_text.text("Extracting video metadata...")
+    video_metadata = video_processor.get_video_metadata(filepath)
+    
+    metadata_db.add_media(
+        media_id=video_id,
+        media_type='video',
+        source_path=filepath,
+        width=video_metadata['width'],
+        height=video_metadata['height'],
+        file_size=file_size,
+        rating=rating
+    )
+    
+    metadata_db.add_video(
+        video_id=video_id,
+        media_id=video_id,
+        duration=video_metadata['duration'],
+        fps=video_metadata['fps'],
+        total_frames=video_metadata['total_frames'],
+        codec=video_metadata['codec']
+    )
+    
+    if tags:
+        for tag in tags:
+            metadata_db.add_media_tag(video_id, tag)
+    
+    status_text.text("Extracting frames from video...")
+    
+    def progress_callback(current, total):
+        progress_bar.progress(min(current / total, 0.5))
+    
+    extracted_frames = video_processor.extract_frames(
+        filepath,
+        every_n_frames=extract_every_n,
+        progress_callback=progress_callback
+    )
+    
+    status_text.text(f"Processing {len(extracted_frames)} frames with segmentation...")
+    segment_extractor = SegmentExtractor(blur_kernel=21)
+    mask_generator = sam_manager.get_automatic_mask_generator()
+    
+    total_segments = 0
+    
+    for frame_idx, frame_info in enumerate(extracted_frames):
+        frame_id = frame_info['frame_id']
+        frame_path = frame_info['frame_path']
+        
+        metadata_db.add_media(
+            media_id=frame_id,
+            media_type='frame',
+            source_path=frame_path,
+            width=video_metadata['width'],
+            height=video_metadata['height'],
+            rating=rating
+        )
+        
+        metadata_db.add_frame(
+            frame_id=frame_id,
+            video_id=video_id,
+            frame_number=frame_info['frame_number'],
+            timestamp=frame_info['timestamp'],
+            media_id=frame_id
+        )
+        
+        img = Image.open(frame_path)
+        img_rgb = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        img_rgb = cv2.cvtColor(img_rgb, cv2.COLOR_BGR2RGB)
+        
+        try:
+            masks = mask_generator.generate(img_rgb)
+            
+            for seg_idx, mask in enumerate(masks[:10]):
+                segment_data = segment_extractor.extract_segment_with_blurred_background(mask, img_rgb)
+                
+                if segment_data is None:
+                    continue
+                
+                segment_id = f"{frame_id}_seg_{seg_idx:03d}"
+                segment_filename = f"{segment_id}.jpg"
+                segment_path = os.path.join(SEGMENTS_DIR, segment_filename)
+                
+                segment_pil = segment_data['pil_image']
+                segment_pil.save(segment_path, 'JPEG', quality=95)
+                
+                embedding = model_manager.encode(segment_pil)
+                
+                segment_metadata = {
+                    'segment_id': segment_id,
+                    'source': f"{video_file.name} - Frame {frame_info['frame_number']} Segment {seg_idx}",
+                    'type': 'video_segment',
+                    'video_id': video_id,
+                    'frame_id': frame_id,
+                    'frame_number': frame_info['frame_number'],
+                    'timestamp': frame_info['timestamp'],
+                    'filepath': segment_path,
+                    'parent_filepath': frame_path,
+                    'bbox': segment_data['bbox'],
+                    'rating': rating
+                }
+                
+                vector_db.add_segments(
+                    embeddings=[embedding],
+                    metadatas=[segment_metadata],
+                    ids=[segment_id]
+                )
+                
+                metadata_db.add_segment(
+                    segment_id=segment_id,
+                    media_id=frame_id,
+                    frame_id=frame_id,
+                    bbox=tuple(segment_data['bbox']),
+                    area=segment_data['area'],
+                    iou_score=segment_data['iou'],
+                    stability_score=segment_data['stability']
+                )
+                
+                total_segments += 1
+        except Exception as e:
+            st.warning(f"Could not segment frame {frame_info['frame_number']}: {e}")
+        
+        progress_bar.progress(0.5 + 0.5 * (frame_idx + 1) / len(extracted_frames))
+    
+    progress_bar.empty()
+    status_text.empty()
+    
+    return video_id, len(extracted_frames), total_segments
 
 def process_video_with_tags(video_file, model_manager, vector_db, metadata_db, video_processor,
                              extract_every_n=30, tags=None, rating='safe'):
@@ -479,6 +627,11 @@ def upload_interface(model_manager, vector_db, metadata_db, video_processor, sam
                 value=30,
                 help="Lower = more frames (slower)"
             )
+            enable_video_segmentation = st.checkbox(
+                "Enable frame segmentation",
+                value=False,
+                help="Apply segmentation to extracted frames (very slow but enables segment-level search in videos)"
+            )
     
     if media_type == "Images" and uploaded_files:
         if st.button("Process Images", type="primary", use_container_width=True):
@@ -522,14 +675,120 @@ def upload_interface(model_manager, vector_db, metadata_db, video_processor, sam
     elif media_type == "Video" and uploaded_file:
         if st.button("Process Video", type="primary", use_container_width=True):
             try:
-                video_id, frame_count = process_video_with_tags(
-                    uploaded_file, model_manager, vector_db, metadata_db, video_processor,
-                    extract_every_n=extract_every, tags=tags_input, rating=rating
-                )
-                st.success(f"✓ Processed video: {frame_count} frames extracted!")
+                if enable_video_segmentation:
+                    sam_manager.load_model()
+                    video_id, frame_count, segment_count = process_video_with_segments(
+                        uploaded_file, model_manager, vector_db, metadata_db, video_processor,
+                        sam_manager, extract_every_n=extract_every, tags=tags_input, rating=rating
+                    )
+                    st.success(f"✓ Processed video: {frame_count} frames extracted, {segment_count} segments created!")
+                else:
+                    video_id, frame_count = process_video_with_tags(
+                        uploaded_file, model_manager, vector_db, metadata_db, video_processor,
+                        extract_every_n=extract_every, tags=tags_input, rating=rating
+                    )
+                    st.success(f"✓ Processed video: {frame_count} frames extracted!")
                 st.rerun()
             except Exception as e:
                 st.error(f"Error processing video: {e}")
+
+def segment_library_interface(model_manager, vector_db, metadata_db):
+    """Browse and search segment library"""
+    st.header("🔲 Segment Library")
+    
+    col1, col2, col3 = st.columns([2, 1, 1])
+    
+    with col1:
+        search_mode = st.radio("Search Segments By", ["All Segments", "Text", "Image"], horizontal=True)
+    
+    with col2:
+        segment_type = st.selectbox(
+            "Type Filter",
+            ["All", "Image Segments", "Video Segments"]
+        )
+    
+    with col3:
+        n_results = st.number_input("Results", min_value=1, max_value=100, value=20)
+    
+    if search_mode == "Text":
+        query = st.text_input(
+            "Search segments by description",
+            placeholder="e.g., 'person', 'car', 'red object'"
+        )
+        if st.button("🔍 Search", type="primary"):
+            if query:
+                with st.spinner(f"Searching for '{query}'..."):
+                    query_embedding = model_manager.encode_text(query)
+                    results = vector_db.search_by_embedding(query_embedding, n_results=n_results)
+                    
+                    if segment_type != "All":
+                        filter_type = "segment" if segment_type == "Image Segments" else "video_segment"
+                        filtered_results = {
+                            'ids': [[]],
+                            'metadatas': [[]],
+                            'distances': [[]]
+                        }
+                        for i, meta in enumerate(results['metadatas'][0]):
+                            if meta.get('type') == filter_type:
+                                filtered_results['ids'][0].append(results['ids'][0][i])
+                                filtered_results['metadatas'][0].append(meta)
+                                filtered_results['distances'][0].append(results['distances'][0][i])
+                        results = filtered_results
+                    
+                    display_media_grid(results, metadata_db, vector_db)
+    
+    elif search_mode == "Image":
+        query_image = st.file_uploader("Upload reference image", type=['jpg', 'jpeg', 'png'])
+        if st.button("🔍 Find Similar Segments", type="primary"):
+            if query_image:
+                with st.spinner("Finding similar segments..."):
+                    img = Image.open(query_image)
+                    query_embedding = model_manager.encode(img)
+                    results = vector_db.search_by_embedding(query_embedding, n_results=n_results)
+                    
+                    if segment_type != "All":
+                        filter_type = "segment" if segment_type == "Image Segments" else "video_segment"
+                        filtered_results = {
+                            'ids': [[]],
+                            'metadatas': [[]],
+                            'distances': [[]]
+                        }
+                        for i, meta in enumerate(results['metadatas'][0]):
+                            if meta.get('type') == filter_type:
+                                filtered_results['ids'][0].append(results['ids'][0][i])
+                                filtered_results['metadatas'][0].append(meta)
+                                filtered_results['distances'][0].append(results['distances'][0][i])
+                        results = filtered_results
+                    
+                    display_media_grid(results, metadata_db, vector_db)
+    
+    else:
+        if st.button("📋 Show All Segments", type="primary"):
+            with st.spinner("Loading segments..."):
+                try:
+                    all_results = vector_db.collection.get(limit=n_results)
+                    
+                    if all_results and all_results['ids']:
+                        filtered_results = {
+                            'ids': [[]],
+                            'metadatas': [[]],
+                            'distances': [[]]
+                        }
+                        
+                        for i, meta in enumerate(all_results['metadatas']):
+                            item_type = meta.get('type', '')
+                            if segment_type == "All" or \
+                               (segment_type == "Image Segments" and item_type == "segment") or \
+                               (segment_type == "Video Segments" and item_type == "video_segment"):
+                                filtered_results['ids'][0].append(all_results['ids'][i])
+                                filtered_results['metadatas'][0].append(meta)
+                                filtered_results['distances'][0].append(0.0)
+                        
+                        display_media_grid(filtered_results, metadata_db, vector_db)
+                    else:
+                        st.info("No segments found. Upload images/videos with segmentation enabled.")
+                except Exception as e:
+                    st.error(f"Error loading segments: {e}")
 
 def favorites_interface(metadata_db, vector_db):
     """Display favorited media"""
@@ -677,78 +936,112 @@ def main():
                 st.session_state.confirm_delete = True
                 st.warning("Click again to confirm")
     
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "📤 Upload",
         "🔍 Search",
+        "🔲 Segments",
         "⭐ Favorites",
         "📊 Analytics",
         "ℹ️ About"
     ])
     
     with tab1:
-        upload_interface(model_manager, vector_db, metadata_db, video_processor)
+        upload_interface(model_manager, vector_db, metadata_db, video_processor, sam_manager)
     
     with tab2:
         search_interface(model_manager, vector_db, metadata_db)
     
     with tab3:
-        favorites_interface(metadata_db, vector_db)
+        segment_library_interface(model_manager, vector_db, metadata_db)
     
     with tab4:
-        analytics_interface(metadata_db)
+        favorites_interface(metadata_db, vector_db)
     
     with tab5:
+        analytics_interface(metadata_db)
+    
+    with tab6:
         st.header("About This Application")
         
         st.markdown("""
         ### 🎯 Features
         
         **Media Management**
-        - Upload images and videos
-        - Automatic frame extraction from videos
-        - Tag-based organization with categories
+        - Upload images and videos with automatic processing
+        - Automatic frame extraction from videos (customizable interval)
+        - Advanced segmentation with SAM (segment anything)
+        - Video frame segmentation for segment-level search
+        - Tag-based organization with categories (general, character, artist, meta)
         - Rating system (safe, questionable, explicit)
-        - Favorites/bookmarking
+        - Favorites/bookmarking system
+        
+        **Segmentation & Object Detection**
+        - Extract individual objects from images using SAM
+        - Apply segmentation to video frames
+        - Cropped segment images with blurred backgrounds
+        - Segment library for browsing all extracted segments
+        - Frame-accurate segment tracking with timestamps
         
         **Advanced Search**
-        - Semantic text search using CLIP
-        - Visual similarity search
+        - Semantic text search using CLIP embeddings
+        - Visual similarity search (find similar images/segments)
         - Tag-based filtering with AND/NOT operators
-        - Rating filters
+        - Segment-specific search (find similar objects)
+        - Filter by segment type (image segments vs video segments)
+        - Rating and content filters
         - Multiple sort options
         
+        **Segment Library**
+        - Browse all extracted segments in one place
+        - Search segments by text or visual similarity
+        - Filter by source type (image/video)
+        - Find similar segments across your entire library
+        - Track which frame/image each segment came from
+        
         **Analytics**
-        - Usage statistics
+        - Comprehensive usage statistics
         - Popular tags visualization
-        - Tag cloud
-        - Library insights
+        - Tag cloud by category
+        - Library insights and metrics
+        - Segment counts and distribution
         
         ### 🔬 Technology Stack
         
-        - **CLIP (ViT-B/32)**: Vision-language embeddings
-        - **ChromaDB**: Vector similarity search
-        - **SQLite**: Metadata and tags
-        - **SAM** (optional): Advanced segmentation
-        - **Streamlit**: Modern web interface
-        - **OpenCV & ImageIO**: Video processing
-        
-        ### 🚀 Future Enhancements
-        
-        - Full SAM integration for object segmentation
-        - Segment-level search within images
-        - Advanced filtering and sorting
-        - Batch tagging operations
-        - Export functionality
-        - API access
+        - **CLIP (ViT-B/32)**: Vision-language embeddings for semantic search
+        - **SAM**: Segment Anything Model for object segmentation
+        - **ChromaDB**: High-performance vector similarity search
+        - **SQLite**: Metadata, tags, and relationships
+        - **Streamlit**: Modern, responsive web interface
+        - **OpenCV & ImageIO**: Video/image processing
+        - **PyTorch**: Deep learning framework
         
         ### 💡 Booru-Style Features
         
         This application is inspired by booru imageboards like Gelbooru and Yande.re:
-        - Tag-based organization
-        - Advanced search operators
-        - Rating system
-        - Community-style features
-        - Grid layout with metadata
+        - Tag-based organization with multiple tag types
+        - Advanced search operators (combine/exclude tags)
+        - Rating system for content filtering
+        - Grid layout with thumbnails and metadata
+        - Favorites system
+        - High-quality media browsing
+        - Semantic and visual similarity search
+        
+        ### 🚀 How It Works
+        
+        1. **Upload**: Add images or videos with tags and ratings
+        2. **Segment** (optional): Extract individual objects using SAM
+        3. **Embed**: Generate CLIP embeddings for semantic search
+        4. **Search**: Find media by text, tags, or visual similarity
+        5. **Browse**: Explore your library through segments or favorites
+        
+        ### 📊 Use Cases
+        
+        - **Media Libraries**: Organize large collections of images/videos
+        - **Content Management**: Tag and categorize visual content
+        - **Object Search**: Find specific objects across media
+        - **Video Analysis**: Extract and search video segments
+        - **Research**: Analyze visual datasets with semantic search
+        - **Art Collections**: Manage artwork with booru-style tagging
         """)
 
 if __name__ == "__main__":
